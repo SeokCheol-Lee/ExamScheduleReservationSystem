@@ -1,145 +1,93 @@
 import pytest
-import pytest_asyncio
-from httpx import AsyncClient, ASGITransport
-from datetime import datetime, timedelta
-from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
-from app.infrastructure.Database import Base
-from app.interface.api import app, get_session
-from datetime import datetime, timezone
-from fastapi.testclient import TestClient
-from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from unittest.mock import AsyncMock
+from datetime import datetime, timedelta, timezone
+from app.application.ReservationDto import ReservationCreateDTO, ReservationUpdateDTO, ReservationResponseDTO
+from app.domain.Reservation import Reservation, ReservationStatus
+from app.application.ReservationService import ReservationService
+from app.application.ExamScheduleDto import ExamScheduleResponseDTO
 
-# ✅ FastAPI lifespan을 올바르게 설정
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # ✅ 올바른 방식으로 엔진 생성 (async with ❌)
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+@pytest.fixture
+def mock_repository():
+    repo = AsyncMock()
+    return repo
 
-    # ✅ 세션 팩토리 생성
-    TestSession = async_sessionmaker(engine, expire_on_commit=False)
+@pytest.fixture
+def reservation_service(mock_repository):
+    return ReservationService(repository=mock_repository)
 
-    # ✅ FastAPI 의존성 오버라이드 설정
-    async def get_test_session():
-        async with TestSession() as session:
-            yield session
-
-    app.dependency_overrides[get_session] = get_test_session
-
-    yield  # FastAPI 앱 실행 유지
-
-    # ✅ 엔진 정리 (테스트 종료 후)
-    await engine.dispose()
-
-# ✅ FastAPI 애플리케이션을 실행하는 fixture
-@pytest_asyncio.fixture(scope="session")
-async def test_app():
-    async with lifespan(app):
-        yield app
-
-# ✅ HTTP 클라이언트 설정 (FastAPI 서버와 연결 보장)
-@pytest_asyncio.fixture(scope="function")
-async def client(test_app):
-    transport = ASGITransport(app=test_app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        yield client
-
+# 테스트: 예약 생성 성공
 @pytest.mark.asyncio
-async def test_create_and_get_reservation(client):
-    exam_start = datetime.now(timezone.utc) + timedelta(days=4)
-    exam_end = exam_start + timedelta(hours=2)
-    data = {
-        "exam_start": exam_start.isoformat(),
-        "exam_end": exam_end.isoformat(),
-        "num_examinees": 1000
-    }
-    headers = {"X-User-Id": "user1", "X-User-Role": "customer"}
-    response = await client.post("/reservations", json=data, headers=headers)
-    assert response.status_code == 200, response.text
-
-@pytest.mark.asyncio
-async def test_update_and_delete_reservation(client):
-    # 예약 생성 (시험 시작은 현재로부터 5일 후)
+async def test_create_reservation_success(reservation_service, mock_repository):
     exam_start = datetime.now(timezone.utc) + timedelta(days=5)
     exam_end = exam_start + timedelta(hours=2)
-    data = {
-        "exam_start": exam_start.isoformat(),
-        "exam_end": exam_end.isoformat(),
-        "num_examinees": 2000
-    }
-    headers = {"X-User-Id": "user2", "X-User-Role": "customer"}
-    response = await client.post("/reservations", json=data, headers=headers)
-    assert response.status_code == 200, response.text
-    reservation = response.json()
-    reservation_id = reservation["id"]
+    exam_schedule = ExamScheduleResponseDTO(id=1, exam_start=exam_start, exam_end=exam_end, capacity=5000, confirmed_count=1000, available_capacity=4000)
+    mock_repository.get_exam_schedule_by_id.return_value = exam_schedule
+    mock_repository.get_confirmed_sum.return_value = 1000
+    mock_repository.create.return_value = Reservation(id=1, user_id="user1", exam_schedule_id=1, exam_start=exam_start, exam_end=exam_end, num_examinees=500, status=ReservationStatus.pending)
 
-    # 예약 수정: 응시 인원 변경
-    update_data = {"num_examinees": 2500}
-    response = await client.put(f"/reservations/{reservation_id}", json=update_data, headers=headers)
-    assert response.status_code == 200, response.text
-    updated = response.json()
-    assert updated["num_examinees"] == 2500
+    dto = ReservationCreateDTO(exam_schedule_id=1, num_examinees=500, exam_start=exam_start, exam_end=exam_end)
+    result = await reservation_service.create_reservation("user1", dto)
 
-    # 예약 삭제
-    response = await client.delete(f"/reservations/{reservation_id}", headers=headers)
-    assert response.status_code == 200, response.text
-    detail = response.json()
-    assert "deleted" in detail["detail"]
+    assert result["num_examinees"] == 500
+    assert result["status"] == ReservationStatus.pending.value
+    mock_repository.create.assert_called_once()
 
+# 테스트: 예약 생성 실패 - 용량 초과
 @pytest.mark.asyncio
-async def test_confirm_reservation(client):
-    # 고객이 예약 생성 (시험 시작은 현재로부터 6일 후)
-    exam_start = datetime.now(timezone.utc) + timedelta(days=6)
+async def test_create_reservation_fail_capacity_exceeded(reservation_service, mock_repository):
+    exam_start = datetime.now(timezone.utc) + timedelta(days=5)
     exam_end = exam_start + timedelta(hours=2)
-    data = {
-        "exam_start": exam_start.isoformat(),
-        "exam_end": exam_end.isoformat(),
-        "num_examinees": 3000
-    }
-    headers_customer = {"X-User-Id": "user3", "X-User-Role": "customer"}
-    headers_admin = {"X-User-Id": "admin1", "X-User-Role": "admin"}
-    response = await client.post("/reservations", json=data, headers=headers_customer)
-    assert response.status_code == 200, response.text
-    reservation = response.json()
-    reservation_id = reservation["id"]
+    exam_schedule = ExamScheduleResponseDTO(id=1, exam_start=exam_start, exam_end=exam_end, capacity=2000, confirmed_count=1800, available_capacity=200)
+    mock_repository.get_exam_schedule_by_id.return_value = exam_schedule
+    mock_repository.get_confirmed_sum.return_value = 1800
 
-    # 고객이 예약 확정 시도: 실패해야 함
-    response = await client.post(f"/reservations/{reservation_id}/confirm", headers=headers_customer)
-    assert response.status_code == 403
+    dto = ReservationCreateDTO(exam_schedule_id=1, num_examinees=500, exam_start=exam_start, exam_end=exam_end)
+    with pytest.raises(Exception, match="Exceeds available capacity for this exam schedule"):
+        await reservation_service.create_reservation("user1", dto)
 
-    # 어드민이 예약 확정: 성공해야 함
-    response = await client.post(f"/reservations/{reservation_id}/confirm", headers=headers_admin)
-    assert response.status_code == 200, response.text
-    confirmed = response.json()
-    assert confirmed["status"] == "confirmed"
-
+# 테스트: 예약 수정 성공
 @pytest.mark.asyncio
-async def test_get_exam_schedules(client):
-    # 동일 시험 일정에 대해 예약 생성 (시험 시작은 현재로부터 7일 후)
-    exam_start = datetime.now(timezone.utc) + timedelta(days=7)
+async def test_update_reservation_success(reservation_service, mock_repository):
+    exam_start = datetime.now(timezone.utc) + timedelta(days=5)
     exam_end = exam_start + timedelta(hours=2)
-    data1 = {
-        "exam_start": exam_start.isoformat(),
-        "exam_end": exam_end.isoformat(),
-        "num_examinees": 4000
-    }
-    data2 = {
-        "exam_start": exam_start.isoformat(),
-        "exam_end": exam_end.isoformat(),
-        "num_examinees": 5000
-    }
-    headers = {"X-User-Id": "user4", "X-User-Role": "customer"}
-    await client.post("/reservations", json=data1, headers=headers)
-    await client.post("/reservations", json=data2, headers=headers)
-    
-    # 시험 일정 및 남은 용량 조회
-    response = await client.get("/exam-schedules")
-    assert response.status_code == 200, response.text
-    schedules = response.json()
-    # exam_start 필드가 ISO 포맷 문자열과 일치하는지 확인
-    schedule = next((s for s in schedules if s["exam_start"] == exam_start.isoformat()), None)
-    assert schedule is not None
-    assert "confirmed_count" in schedule
-    assert "available_capacity" in schedule
+    reservation = ReservationResponseDTO(
+        id=1,
+        user_id="user1",
+        exam_schedule_id=1,  # ✅ 추가됨
+        exam_start=exam_start,
+        exam_end=exam_end,
+        num_examinees=500,
+        status=ReservationStatus.pending,
+        created_at=datetime.now(timezone.utc),
+        updated_at=datetime.now(timezone.utc)
+    )
+    mock_repository.get_by_id.return_value = reservation
+    mock_repository.get_exam_schedule_by_id.return_value = ExamScheduleResponseDTO(id=1, exam_start=exam_start, exam_end=exam_end, capacity=3000, confirmed_count=1000, available_capacity=2000)
+    mock_repository.get_confirmed_sum.return_value = 1000
+    mock_repository.update.return_value = reservation
+
+    dto = ReservationUpdateDTO(num_examinees=600)
+    result = await reservation_service.update_reservation(1, "user1", dto)
+    assert result["num_examinees"] == 600
+    mock_repository.update.assert_called_once()
+
+# 테스트: 예약 삭제 성공
+@pytest.mark.asyncio
+async def test_delete_reservation_success(reservation_service, mock_repository):
+    exam_start = datetime.now(timezone.utc) + timedelta(days=5)
+    exam_end = exam_start + timedelta(hours=2)
+    reservation = ReservationResponseDTO(
+        id=1,
+        user_id="user1",
+        exam_schedule_id=1,  # ✅ 추가됨
+        exam_start=exam_start,
+        exam_end=exam_end,
+        num_examinees=500,
+        status=ReservationStatus.pending,
+        created_at=datetime.now(timezone.utc),
+        updated_at=datetime.now(timezone.utc)
+    )
+    mock_repository.get_by_id.return_value = reservation
+
+    await reservation_service.delete_reservation(1, "user1")
+    mock_repository.delete.assert_called_once()

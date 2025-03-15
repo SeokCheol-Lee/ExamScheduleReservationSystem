@@ -10,12 +10,19 @@ class ReservationORM(Base):
     __tablename__ = "reservations"
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(String, index=True)
-    exam_start = Column(DateTime(timezone=True), nullable=False)  # 변경됨
-    exam_end = Column(DateTime(timezone=True), nullable=False)    # 변경됨
+    exam_schedule_id = Column(Integer, nullable=False)
     num_examinees = Column(Integer, nullable=False)
-    status = Column(String, nullable=False, default=ReservationStatus.pending)
-    created_at = Column(DateTime, default=datetime)
-    updated_at = Column(DateTime, default=datetime, onupdate=datetime)
+    status = Column(String, nullable=False, default=ReservationStatus.pending.value)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+class ExamScheduleORM(Base):
+    __tablename__ = "exam_schedules"
+    id = Column(Integer, primary_key=True, index=True)
+    exam_start = Column(DateTime(timezone=True), nullable=False)
+    exam_end = Column(DateTime(timezone=True), nullable=False)
+    capacity = Column(Integer, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 # Reservation Repository 구현
 class ReservationRepository:
@@ -25,8 +32,7 @@ class ReservationRepository:
     async def create(self, reservation: Reservation) -> ReservationORM:
         orm_obj = ReservationORM(
             user_id=reservation.user_id,
-            exam_start=reservation.exam_start,
-            exam_end=reservation.exam_end,
+            exam_schedule_id=reservation.exam_schedule_id,
             num_examinees=reservation.num_examinees,
             status=reservation.status.value if isinstance(reservation.status, ReservationStatus) else reservation.status
         )
@@ -59,41 +65,63 @@ class ReservationRepository:
         await self.session.delete(reservation)
         await self.session.commit()
 
-    async def get_confirmed_sum(self, exam_start, exam_end, exclude_id: int = None) -> int:
+    async def get_confirmed_sum(self, exam_schedule_id: int, exclude_id: int = None) -> int:
         stmt = select(func.coalesce(func.sum(
             case(
                 (ReservationORM.status == ReservationStatus.confirmed.value, ReservationORM.num_examinees),
                 else_=0
             )
-        ), 0)).where(
-            ReservationORM.exam_start == exam_start,
-            ReservationORM.exam_end == exam_end
-        )
+        ), 0)).where(ReservationORM.exam_schedule_id == exam_schedule_id)
+        
         if exclude_id:
             stmt = stmt.where(ReservationORM.id != exclude_id)
+        
         result = await self.session.execute(stmt)
         return result.scalar() or 0
 
     async def get_exam_schedules(self):
         stmt = select(
-            ReservationORM.exam_start,
-            ReservationORM.exam_end,
+            ExamScheduleORM.id,
+            ExamScheduleORM.exam_start,
+            ExamScheduleORM.exam_end,
+            ExamScheduleORM.capacity,
             func.coalesce(func.sum(
                 case(
                     (ReservationORM.status == ReservationStatus.confirmed.value, ReservationORM.num_examinees),
                     else_=0
                 )
             ), 0).label("confirmed_count")
-        ).group_by(ReservationORM.exam_start, ReservationORM.exam_end)
+        ).outerjoin(ReservationORM, ExamScheduleORM.id == ReservationORM.exam_schedule_id)
+        stmt = stmt.group_by(ExamScheduleORM.id)
+        
         result = await self.session.execute(stmt)
         schedules = []
         for row in result.all():
-            exam_start, exam_end, confirmed_count = row
-            available_capacity = max(50000 - confirmed_count, 0)
+            exam_schedule_id, exam_start, exam_end, capacity, confirmed_count = row
+            available_capacity = max(capacity - confirmed_count, 0)
             schedules.append({
+                "exam_schedule_id": exam_schedule_id,
                 "exam_start": exam_start,
                 "exam_end": exam_end,
+                "capacity": capacity,
                 "confirmed_count": confirmed_count,
                 "available_capacity": available_capacity
             })
         return schedules
+
+    async def create_exam_schedule(self, exam_start: datetime, exam_end: datetime, capacity: int) -> ExamScheduleORM:
+        exam_schedule = ExamScheduleORM(
+            exam_start=exam_start,
+            exam_end=exam_end,
+            capacity=capacity
+        )
+        self.session.add(exam_schedule)
+        await self.session.commit()
+        await self.session.refresh(exam_schedule)
+        return exam_schedule
+
+    # 추가: exam_schedule_id로 ExamSchedule 조회하는 메서드
+    async def get_exam_schedule_by_id(self, exam_schedule_id: int):
+        stmt = select(ExamScheduleORM).where(ExamScheduleORM.id == exam_schedule_id)
+        result = await self.session.execute(stmt)
+        return result.scalar_one_or_none()
